@@ -3,7 +3,7 @@ from datasets import Dataset, load_dataset
 from peft import LoraConfig, get_peft_model
 import torch
 from rich import print
-
+import math
 from grpo import GRPO
 
 
@@ -58,14 +58,14 @@ model = model.to(torch.bfloat16)
 
 
 def reward_func_len(s: str):
-    return len(s)
+    return len(s)/1000
 
 
 dataset = load_dataset("openai/gsm8k", "main")["train"]
 dataset = prepare_dataset(dataset)
 
-batch_size = 2
-group_size = 3
+batch_size = 8
+group_size = 8
 reward_functions = [
     reward_func_len,
 ]
