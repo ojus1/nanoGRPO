@@ -42,9 +42,9 @@ def prepare_dataset(dataset) -> Dataset:
 # small models are kind of dumb, they need a little push so using this fine-tuned model
 # source: https://github.com/joey00072/nanoGRPO/blob/master/cold_start/cold_start_finetune.py
 # you can totally use the base model, it will just take longer to converge
-# model_name = "joey00072/Llama-3.2-1B-Instruct-cold-start-ft2"
+model_name = "joey00072/Llama-3.2-1B-Instruct-cold-start-ft2"
 
-model_name = "unsloth/Llama-3.2-1B-Instruct"
+# model_name = "unsloth/Llama-3.2-3B-Instruct"
 
 
 model = AutoModelForCausalLM.from_pretrained(model_name)
@@ -54,7 +54,6 @@ lora_config = LoraConfig(
     r=8,
     lora_alpha=16,
     # lora_dropout=0.1,
-    use_dora=True,
 )
 model = get_peft_model(model, lora_config)
 model = model.to(torch.bfloat16)
@@ -66,7 +65,10 @@ def reward_func_len(sample: dict, s: str, *args, **kwargs):
 def response_format_reward(sample: dict, s: str, *args, **kwargs):
     # print(sample.keys())
     correct_template =0
-    s = s.split("<|eot_id|><|start_header_id|>assistant<|end_header_id|>")[1]
+    try:
+        s = s.split("<|eot_id|><|start_header_id|>assistant<|end_header_id|>")[1]
+    except:
+        return -1
     if "<|eot_id|>" in s:
         s = s.split("<|eot_id|>")[0]
     try:
@@ -138,7 +140,7 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs):
             total_reward -=0.1
     if correct_template == 3:
         total_reward += 2
-    return total_reward*3 + (2-len(s)/1000)
+    return total_reward
 
 
 

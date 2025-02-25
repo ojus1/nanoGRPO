@@ -122,15 +122,16 @@ class GRPO:
         max_new_tokens = 512
         outputs = self.model.generate(
             input_ids.to(self.device),
-            min_new_tokens=512,
+            # min_new_tokens=512,
             max_new_tokens=max_new_tokens,
             temperature=0.9,
+            # repetition_penalty=1.1,
         )
         end_time = time.time()
         print(f"Time for generation: {end_time - start_time} seconds")
 
         decoded_outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=False)
-        # print(decoded_outputs[0])
+        
         rewards = self.compute_rewards(samples,decoded_outputs)
 
         loss_mask = torch.zeros(outputs.shape, dtype=torch.bool)
