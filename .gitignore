@@ -1,6 +1,8 @@
 unsloth_compiled_cache/
 outputs/
 dev*
+wandb/
+cold_start/
 
 # Python
 __pycache__/

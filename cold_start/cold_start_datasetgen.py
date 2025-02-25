@@ -8,7 +8,8 @@ from tqdm import tqdm
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-SYSTEM_PROMPT = "Must answer in following format <thinking>{find answer}</thinking></answer><number>{number}</number>"
+SYSTEM_PROMPT = "Respond in following format:<thinking>{step by step reasoning}</thinking><answer>{number}</answer>"
+
 dataset = load_dataset("openai/gsm8k", "main")["train"]
 
 
@@ -23,7 +24,7 @@ def openai_call(prompt):
     return response.choices[0].message.content
 
 
-num_generations = 1000
+num_generations = 250
 fine_name = "cold_start_datasetgen.json"
 lst = []
 for data in tqdm(

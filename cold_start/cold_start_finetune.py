@@ -5,10 +5,10 @@ from transformers import TrainingArguments, DataCollatorForSeq2Seq
 from unsloth import is_bfloat16_supported
 
 
-SYSTEM_PROMPT = "Must answer in following format <thinking>{find answer}</thinking></answer><number>{number}</number>"
+SYSTEM_PROMPT = "Respond in following format:<thinking>{step by step reasoning}</thinking><answer>{number}</answer>"
 model_name = "unsloth/Llama-3.2-1B-Instruct"
 hf_username = "joey00072"
-output_model_name = f"{hf_username}/{model_name.split('/')[-1]}-cold-start-ft"
+output_model_name = f"{hf_username}/{model_name.split('/')[-1]}-cold-start-ft2"
 dtype = "bfloat16"
 load_in_4bit = True
 max_seq_length = 1024
@@ -80,8 +80,8 @@ trainer = SFTTrainer(
         gradient_accumulation_steps=4,
         warmup_steps=5,
         # num_train_epochs = 1, # Set this for 1 full training run.
-        max_steps=200,
-        learning_rate=2e-4,
+        max_steps=100,
+        learning_rate=2e-5,
         fp16=not is_bfloat16_supported(),
         bf16=is_bfloat16_supported(),
         logging_steps=1,
@@ -123,21 +123,21 @@ inputs = tokenizer.apply_chat_template(
 
 from transformers import TextStreamer
 
-for idx in range(10):
+for idx in range(16):
     text_streamer = TextStreamer(tokenizer, skip_prompt=True)
     _ = model.generate(
         input_ids=inputs,
         streamer=text_streamer,
-        max_new_tokens=128,
+        max_new_tokens=512,
         use_cache=True,
-        temperature=1.5,
+        temperature=1.1,
         min_p=0.1,
     )
     print("-" * 100)
 
 
 # save_model_path = "outputs/Llama-3.2-1B-Instruct-FT"
-# model.save_pretrained(save_model_path)
-# tokenizer.save_pretrained(save_model_path)
+# model.save_pretrained(output_model_name)
+# tokenizer.save_pretrained(output_model_name)
 
 model.push_to_hub_merged(output_model_name, tokenizer, save_method="merged_16bit")
