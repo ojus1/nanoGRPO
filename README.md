@@ -52,9 +52,7 @@ Average inches for the entire year ≈ 29.74 inches
 
 
 $$
-
 J_{GRPO}(\theta)  = \frac{1}{G} \sum_{i=1}^{G} \left( \min \left( \frac{\pi_{\theta}(o_i|q)}{\pi_{\theta_{old}}(o_i|q)} A_i, \text{clip} \left( \frac{\pi_{\theta}(o_i|q)}{\pi_{\theta_{old}}(o_i|q)}, 1 - \epsilon, 1 + \epsilon \right) A_i \right) \right)
-
 $$
 
 
