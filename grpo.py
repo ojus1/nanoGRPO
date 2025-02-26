@@ -23,7 +23,9 @@ class GRPO:
         log_wandb=False,
         dtype=None,
         lr=5e-6,
-        weight_decay=0.0
+        weight_decay=0.0,
+        beta=0.0,
+        epsilon=0.1
     ):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
@@ -37,8 +39,8 @@ class GRPO:
         self.batch_size = batch_size
         self.max_iterations = max_iterations
         self.dtype = dtype if dtype is not None else (torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
-        self.beta = 0.0
-        self.epsilon = 0.1
+        self.beta = beta
+        self.epsilon = epsilon
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr,weight_decay=weight_decay)
         assert reward_functions is not None, "Must pass reward_functions"
         self.reward_functions: list = reward_functions
