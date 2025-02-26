@@ -131,7 +131,7 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs):
                         total_reward += 3
                         correct_template += 1
                     else:
-                        total_reward -= len(split[1].strip())/100
+                        total_reward -= len(split[1].strip())/1000
                 else:
                     total_reward -= 0.2
             else:
@@ -149,7 +149,7 @@ dataset = prepare_dataset(dataset)
 
 group_size = 8
 micro_group_size =2
-lr = 5e-5
+lr = 5e-6
 weight_decay = 0.1
 reward_functions = [
     response_format_reward,
