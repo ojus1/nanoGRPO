@@ -61,4 +61,4 @@ $$
 origal paper: https://arxiv.org/pdf/2402.03300 <br>
 r1 paper: https://arxiv.org/pdf/2501.12948
 
-grpo is ppo with adavantage esteemed as z score of grouped ouput instaed of using value function 
+grpo is ppo with adavantage esteemed as z score of grouped output instaed of using value function 
