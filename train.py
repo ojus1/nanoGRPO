@@ -7,7 +7,7 @@ import math
 from grpo import GRPO
 
 
-SYSTEM_PROMPT = "Respond in following format:<thinking>{step by step reasoning}</thinking><answer>{number}</answer>"
+SYSTEM_PROMPT = "Respond in following XML format:\n<thinking>step by step reasoning</thinking><answer>some number</answer>"
 
 
 def prepare_dataset(dataset) -> Dataset:
@@ -53,6 +53,8 @@ tokenizer = AutoTokenizer.from_pretrained(model_name)
 lora_config = LoraConfig(
     r=8,
     lora_alpha=16,
+    target_modules='all-linear',
+    # use_dora=True,
     # lora_dropout=0.1,
 )
 model = get_peft_model(model, lora_config)
@@ -147,9 +149,10 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs):
 dataset = load_dataset("openai/gsm8k", "main")["train"]
 dataset = prepare_dataset(dataset)
 
-group_size = 8
-micro_group_size =2
-lr = 5e-6
+group_size = 16
+micro_group_size = 4
+batch_size = 1
+lr = 2e-5
 weight_decay = 0.1
 reward_functions = [
     response_format_reward,
@@ -168,7 +171,8 @@ trainer = GRPO(
     reward_functions=reward_functions,
     log_wandb=True,
     lr=lr,
-    weight_decay=weight_decay
+    weight_decay=weight_decay,
+    batch_size=batch_size
 )
 
 trainer.train()
