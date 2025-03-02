@@ -52,8 +52,10 @@ class GRPO:
         self.generate_config = copy.deepcopy(self.model.generation_config)
 
         self.using_lora = True if self.ref_model is None else False
-        if self.using_lora:
-            self.ref_model = model
+        if beta > 0:
+            if self.using_lora:
+                self.ref_model = model
+            self.ref_model.to(self.device).to(dtype)
 
         self.log_wandb = log_wandb
         if self.log_wandb:
@@ -61,7 +63,6 @@ class GRPO:
 
         self.metrics = defaultdict(list)
 
-        self.ref_model.to(self.device).to(dtype)
 
         # self.warmup_compile()
         # print("warmup done!")
@@ -115,7 +116,7 @@ class GRPO:
         return loss.mean(), loss1.mean(), loss2.mean()
 
     def sample_batch(self):
-
+        self.tokenizer.padding_side = "left"
         inputs_texts = []
         samples = []
         for _ in range(self.batch_size):
@@ -158,7 +159,7 @@ class GRPO:
 
         decoded_outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=False)
         decoded_outputs = [
-            d
+            "<thinking>" + d
             .replace(inputs_texts[i // self.group_size], "")
             .replace(self.tokenizer.eos_token, "")
             # .replace(self.tokenizer.bos_token, "")
@@ -171,6 +172,7 @@ class GRPO:
         print(f"Average decoded length: {avg_decoded_length.mean().item()}")
         self.metrics["avg_decoded_length"].append(avg_decoded_length.mean().item())
 
+        self.tokenizer.padding_side = "right"
         return outputs, torch.tensor(rewards, dtype=self.dtype).float(), loss_mask[:, 1:]
 
     def compute_rewards(self,samples, responses) -> list:
@@ -202,11 +204,16 @@ class GRPO:
     
     def log_metrics(self):
         if self.log_wandb:
+            if "idx" not in self.metrics or not self.metrics["idx"]:
+                return  # No metrics to log yet
+            
             idx = self.metrics["idx"][-1]-1
             metrics = {}
             for k, v in self.metrics.items():
-                metrics[f"train/{k}"] = v[idx] if len(v) >= idx else v[-1]
-                
+                if not v:  # Skip empty lists
+                    continue
+                metrics[f"train/{k}"] = v[idx] if len(v) > idx else v[-1]
+            
             wandb.log(metrics)
 
     def train(self, epochs=1, max_iterations=1000):
