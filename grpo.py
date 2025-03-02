@@ -1,4 +1,5 @@
 import torch
+torch.set_float32_matmul_precision('high')
 import torch.nn.functional as F
 from torch import Tensor
 import contextlib
@@ -121,7 +122,7 @@ class GRPO:
             item = next(self.data_loader_iter)
             samples.append(item)
             prompt = item["prompt"]
-            formatted = self.tokenizer.apply_chat_template(prompt, tokenize=False)
+            formatted = self.tokenizer.apply_chat_template(prompt, tokenize=False, continue_final_message=True)
             inputs_texts.append(formatted)
 
         encoded = self.tokenizer(inputs_texts, padding=True, return_tensors="pt")
@@ -131,28 +132,44 @@ class GRPO:
         prompt_length = input_ids.shape[1]
 
         input_ids = torch.repeat_interleave(input_ids, self.group_size, dim=0)
+        attention_mask = torch.repeat_interleave(attention_mask, self.group_size, dim=0)
         samples = [sample for _ in range(self.group_size) for sample in samples]
 
         start_time = time.time()
         outputs = self.model.generate(
             input_ids.to(self.device),
+            attention_mask=attention_mask.to(self.device),
             temperature=0.9,
             max_new_tokens=1024,
             top_p=0.9,
+
             # generation_config=self.generate_config
         )
         end_time = time.time()
         print(f"Time for generation: {end_time - start_time} seconds")
 
-        decoded_outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=False)
-        
-        rewards = self.compute_rewards(samples,decoded_outputs)
 
         loss_mask = torch.zeros(outputs.shape, dtype=torch.bool)
 
         gen_tokens = outputs[:, prompt_length:]
         valid_gen_mask = gen_tokens != self.tokenizer.pad_token_id
+        # valid_gen_mask = valid_gen_mask * (gen_tokens != self.tokenizer.eos_token_id)
         loss_mask[:, prompt_length:] = valid_gen_mask
+
+        decoded_outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=False)
+        decoded_outputs = [
+            d
+            .replace(inputs_texts[i // self.group_size], "")
+            .replace(self.tokenizer.eos_token, "")
+            # .replace(self.tokenizer.bos_token, "")
+            .replace(self.tokenizer.pad_token, "")
+            for i, d in enumerate(decoded_outputs)
+        ]        
+        rewards = self.compute_rewards(samples,decoded_outputs)
+
+        avg_decoded_length = valid_gen_mask.sum(dim=-1) / valid_gen_mask.shape[0]
+        print(f"Average decoded length: {avg_decoded_length.mean().item()}")
+        self.metrics["avg_decoded_length"].append(avg_decoded_length.mean().item())
 
         return outputs, torch.tensor(rewards, dtype=self.dtype).float(), loss_mask[:, 1:]
 
