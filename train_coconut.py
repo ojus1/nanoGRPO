@@ -10,7 +10,8 @@ import re
 SYSTEM_PROMPT = '''You think very carefully in your latent space before speaking out loud.
 You will have <num_thoughts=N> computation budget. 
 Think about the problem at length and use Breadth-First Search approach to solving any problem.
-Enclose your final answer in the format: <answer>{number}</answer>.'''
+After your latent thoughts, you will respond with <answer>NUMBER</answer> format.
+Your answer must provide a single number inside the <answer> tags. Don't continue your response after the </answer> tag.'''
  
 def prepare_dataset(dataset) -> Dataset:
     extract_hash_answer = (
@@ -40,7 +41,7 @@ def prepare_dataset(dataset) -> Dataset:
     return dataset
 
 
-model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+model_name = "Qwen/Qwen2.5-3B-Instruct"
 # small models are kind of dumb, they need a little push so using this fine-tuned model
 # source: https://github.com/joey00072/nanoGRPO/blob/master/cold_start/cold_start_finetune.py
 # you can totally use the base model, it will just take longer to converge
@@ -60,8 +61,8 @@ model.eot_token_id = tokenizer.convert_tokens_to_ids("<eot>")
 lora_config = LoraConfig(
     r=8,
     lora_alpha=16,
-    # target_modules='all-linear',
-    target_modules=['q_proj', 'v_proj', 'k_proj', 'o_proj', 'gate_proj'],
+    target_modules='all-linear',
+    # target_modules=['q_proj', 'v_proj'],
     # use_dora=True,
     # lora_dropout=0.1,
 )
@@ -76,24 +77,43 @@ def extract_xml_answer(text: str) -> str:
 
 # Reward functions
 def correctness_reward_func(sample, response):
-    answer = sample["answer"]
-    extracted_response = extract_xml_answer(response)
-    print("Inside correctness_reward_func; answer: ", answer)
-    print("Inside correctness_reward_func; response: ", extracted_response)
-    return 2.0 if extracted_response == answer else -1.0
+    try:
+        answer = sample["answer"]
+        extracted_response = extract_xml_answer(response)
+        answer = answer.strip().replace(" ", "").replace(",", "")
+        # print("Inside correctness_reward_func; answer: ", answer)
+        # print("Inside correctness_reward_func; response: ", extracted_response)
+        return 2.0 if float(extracted_response) == float(answer) else -1.0
+    except Exception as e:
+        print("Error in correctness_reward_func: ", e)
+        return -1.0
+
+import random
 
 def format_reward_func(sample, response):
+    if random.random() < 0.3:
+        # log 30% of the time
+        print("Logging format reward")
+        print("answer: ", sample["answer"])
+        print("response: ", response)
     format_reward = -1
     if response.count("<answer>") == 1 and response.count("</answer>") == 1 and response.find("<answer>") < response.find("</answer>"):
-        format_reward = 1.0    
+        # Check if there's text after </answer>
+        end_tag_pos = response.find("</answer>") + len("</answer>")
+        if end_tag_pos < len(response.strip()):
+            format_reward = -0.75
+        else:
+            format_reward = 1.0
+    elif response.count("<answer>") == 1 or response.count("</answer>") == 1:
+        format_reward = -0.5
     return format_reward
-
 dataset = load_dataset("openai/gsm8k", "main")["train"]
 dataset = prepare_dataset(dataset)
 
-group_size = 4
-micro_group_size = 2
-batch_size = 2
+group_size = 8
+# micro_group_size = 8
+latent_warmup_ratio = 0.001
+batch_size = 8
 lr = 2e-5
 weight_decay = 0.1
 reward_functions = [
@@ -109,14 +129,18 @@ trainer = GRPO(
     ref_model,
     tokenizer=tokenizer,
     group_size=group_size,
-    micro_group_size=micro_group_size,
+    latent_warmup_ratio=latent_warmup_ratio,
+    max_iterations=5000,
     dataset=dataset,
     reward_functions=reward_functions,
     log_wandb=True,
     lr=lr,
     weight_decay=weight_decay,
     batch_size=batch_size,
-    max_continuous_tokens=4,
+    max_continuous_tokens=16,
+    noise_scale=0.1,
+    forced_prefix="<answer>",
+    stop_token="</answer>",
 )
 
 trainer.train()

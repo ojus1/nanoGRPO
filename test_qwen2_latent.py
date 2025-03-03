@@ -195,6 +195,13 @@ def test_latent_noise_injection():
     prompt = "What is the capital of France? <bot><num_thoughts=3>"
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     
+    # Set non-zero values in the Explorer for testing purposes
+    with torch.no_grad():
+        # Initialize with small but non-zero values to ensure visible differences
+        model.model.explorer.mean.fill_(0.01)
+        diag_indices = (model.model.explorer.tril_indices[0] == model.model.explorer.tril_indices[1])
+        model.model.explorer.cholesky_factors[diag_indices] = 0.1
+    
     # Generate with no noise first
     with torch.inference_mode():
         baseline_outputs = model.generate(
@@ -203,7 +210,7 @@ def test_latent_noise_injection():
             eos_token_id=tokenizer.eos_token_id,
             input_text=prompt,
             return_latent_states=True,
-            noise_scale=0.0,
+            noise_scale=0.0,  # No noise
         )
         
         # Now generate with noise
@@ -213,7 +220,7 @@ def test_latent_noise_injection():
             eos_token_id=tokenizer.eos_token_id,
             input_text=prompt,
             return_latent_states=True,
-            noise_scale=5,  # Small amount of noise
+            noise_scale=5.0,  # Substantial noise
         )
     
     # Extract latent states from both outputs
@@ -356,10 +363,196 @@ def test_mixed_batch_error():
     
     print("Mixed batch error test passed!")
 
+def test_forced_token_generation():
+    print("\nTesting forced token generation...")
+    
+    # Test 1: Forced generation in normal mode
+    normal_prompt = "What is the capital of France?"
+    inputs_normal = tokenizer(normal_prompt, return_tensors="pt").to(device)
+    
+    # Create forced tokens - we'll force "Paris" as the answer
+    forced_tokens = tokenizer(" Paris", return_tensors="pt").input_ids.to(device)
+    forced_token_list = [t.squeeze(0) for t in forced_tokens.split(1, dim=1)]
+    
+    # Generate with forced tokens
+    with torch.inference_mode():
+        normal_outputs = model.generate(
+            inputs_normal.input_ids,
+            max_new_tokens=20,
+            eos_token_id=tokenizer.eos_token_id,
+            input_text=normal_prompt,
+            forced_token_ids=forced_token_list,
+        )
+    
+    # Decode and verify output contains our forced tokens
+    normal_text = tokenizer.decode(normal_outputs[0], skip_special_tokens=True)
+    print(f"Normal generation with forced tokens: {normal_text}")
+    forced_text = tokenizer.decode(forced_tokens[0], skip_special_tokens=True)
+    assert forced_text in normal_text, f"Forced text '{forced_text}' not found in output '{normal_text}'"
+    
+    # Test 2: Forced generation in latent mode
+    latent_prompt = "What is the capital of France? <bot><num_thoughts=3>"
+    inputs_latent = tokenizer(latent_prompt, return_tensors="pt").to(device)
+    
+    # Generate with forced tokens in latent mode
+    with torch.inference_mode():
+        latent_outputs = model.generate(
+            inputs_latent.input_ids,
+            max_new_tokens=20,
+            eos_token_id=tokenizer.eos_token_id,
+            input_text=latent_prompt,
+            forced_token_ids=forced_token_list,
+            return_latent_states=True,
+        )
+    
+    # Decode and verify output contains our forced tokens
+    latent_text = tokenizer.decode(latent_outputs['answer_token_ids'][0], skip_special_tokens=True)
+    print(f"Latent generation with forced tokens: {latent_text}")
+    assert forced_text in latent_text, f"Forced text '{forced_text}' not found in latent output '{latent_text}'"
+    
+    # Test 3: Batch forced generation
+    batch_prompts = [
+        "What is the capital of France?",
+        "What is the capital of Italy?",
+        "What is the capital of Spain?"
+    ]
+    inputs_batch = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(device)
+    
+    # Create forced tokens for batch - we'll force "The capital" for all examples
+    forced_batch_tokens = tokenizer(" The capital", return_tensors="pt").input_ids.to(device)
+    # Expand to batch size
+    forced_batch_tokens = forced_batch_tokens.expand(len(batch_prompts), -1)
+    forced_batch_list = [t for t in forced_batch_tokens.unbind(dim=1)]
+    
+    # Generate with forced tokens in batch mode
+    with torch.inference_mode():
+        batch_outputs = model.generate(
+            inputs_batch.input_ids,
+            max_new_tokens=20,
+            eos_token_id=tokenizer.eos_token_id,
+            input_text=batch_prompts,
+            forced_token_ids=forced_batch_list,
+        )
+    
+    # Verify all outputs contain forced text
+    batch_forced_text = tokenizer.decode(forced_batch_tokens[0], skip_special_tokens=True)
+    for i, output in enumerate(batch_outputs):
+        text = tokenizer.decode(output, skip_special_tokens=True)
+        print(f"Batch item {i} with forced tokens: {text}")
+        assert batch_forced_text in text, f"Forced text not found in batch item {i}"
+    
+    # Test 4: Mixed-length forced tokens (fixed)
+    shorter_forced = tokenizer(" The", return_tensors="pt").input_ids.to(device).squeeze(0)
+    longer_forced = tokenizer(" capital of", return_tensors="pt").input_ids.to(device).squeeze(0)
+    mixed_forced_tokens = torch.cat([shorter_forced, longer_forced], dim=0)
+    mixed_forced_list = [t.unsqueeze(0) for t in mixed_forced_tokens]
+
+    # Generate with mixed-length forced tokens
+    with torch.inference_mode():
+        mixed_outputs = model.generate(
+            inputs_normal.input_ids,  # Using first prompt
+            max_new_tokens=20,
+            eos_token_id=tokenizer.eos_token_id,
+            input_text=normal_prompt,
+            forced_token_ids=mixed_forced_list,
+        )
+
+    mixed_text = tokenizer.decode(mixed_outputs[0], skip_special_tokens=True)
+    mixed_forced_text = tokenizer.decode(mixed_forced_tokens, skip_special_tokens=True)
+    print(f"Mixed-length forced tokens: {mixed_text}")
+    assert mixed_forced_text in mixed_text, f"Mixed forced text '{mixed_forced_text}' not found in output '{mixed_text}'"
+    
+    print("Forced token generation tests completed successfully!")
+
+def test_explorer_gradients():
+    """Test if Explorer parameters receive gradients during training"""
+    print("\nTesting Explorer gradient flow...")
+    
+    # Set model to training mode
+    model.train()
+    
+    # Create a dummy latent token directly 
+    batch_size = 1
+    hidden_size = model.config.hidden_size
+    dummy_latent = torch.zeros(batch_size, 1, hidden_size, device=device, requires_grad=True)
+    
+    # Access the explorer directly
+    model.model.explorer.mean.retain_grad()
+    model.model.explorer.cholesky_factors.retain_grad()
+    
+    # Apply noise to latent tokens - direct call to avoid any no_grad blocks
+    noisy_latent = model.model.explorer.sample(dummy_latent, scale=1.0, deterministic=False)
+    
+    # Create a dummy loss (different from zero to ensure gradient flow)
+    loss = noisy_latent.pow(2).mean()
+    
+    # Backpropagate
+    loss.backward()
+    
+    # Check if Explorer parameters received gradients
+    if model.model.explorer.mean.grad is not None:
+        print("Explorer mean grad norm:", model.model.explorer.mean.grad.norm().item())
+        assert model.model.explorer.mean.grad.norm() > 0, "Explorer mean gradients are zero"
+    else:
+        assert False, "Explorer mean didn't receive gradients"
+        
+    if model.model.explorer.cholesky_factors.grad is not None:
+        print("Explorer cholesky factors grad norm:", model.model.explorer.cholesky_factors.grad.norm().item())
+        assert model.model.explorer.cholesky_factors.grad.norm() > 0, "Explorer cholesky factors gradients are zero"
+    else:
+        assert False, "Explorer cholesky factors didn't receive gradients"
+    
+    print("Explorer gradient test passed successfully!")
+    
+    # Reset model to eval mode
+    model.eval()
+
+def test_explorer_deterministic_mode():
+    """Test if Explorer produces deterministic outputs in eval mode"""
+    print("\nTesting Explorer deterministic behavior...")
+    
+    # Ensure model is in eval mode
+    model.eval()
+    
+    # Prepare test input
+    prompt = "What is the capital of France? <bot><num_thoughts=3>"
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    
+    # Create a dummy latent token
+    dummy_latent = torch.zeros(1, 1, model.config.hidden_size, device=device)
+    
+    # Generate latent tokens with Explorer twice
+    with torch.inference_mode():
+        noisy_latent1 = model._inject_noise_to_latent(dummy_latent, noise_scale=1.0)
+        noisy_latent2 = model._inject_noise_to_latent(dummy_latent, noise_scale=1.0)
+    
+    # In eval mode with deterministic=True, outputs should be identical
+    diff = (noisy_latent1 - noisy_latent2).abs().max().item()
+    print(f"Maximum difference between two deterministic samples: {diff:.10f}")
+    assert diff < 1e-5, "Explorer is not deterministic in eval mode"
+    
+    # Switch to training mode where it should be stochastic
+    model.train()
+    noisy_latent1 = model._inject_noise_to_latent(dummy_latent, noise_scale=1.0)
+    noisy_latent2 = model._inject_noise_to_latent(dummy_latent, noise_scale=1.0)
+    
+    # In training mode, outputs should differ (stochastic)
+    diff = (noisy_latent1 - noisy_latent2).abs().max().item()
+    print(f"Maximum difference between two stochastic samples: {diff:.10f}")
+    assert diff > 1e-5, "Explorer is not stochastic in training mode"
+    
+    # Reset to eval mode
+    model.eval()
+    
+    print("Explorer deterministic behavior test passed!")
+
 if __name__ == "__main__":
     test_latent_reasoning()
     test_latent_probing()
     test_latent_gradients()
     test_latent_noise_injection()
     test_batch_latent_reasoning()
-    test_mixed_batch_error()  # Add the mixed mode test 
+    test_mixed_batch_error()
+    test_forced_token_generation()
+    test_explorer_gradients()
+    test_explorer_deterministic_mode() 

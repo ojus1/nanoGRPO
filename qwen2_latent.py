@@ -33,6 +33,80 @@ import re
 import math
 
 
+from torch.distributions import MultivariateNormal
+
+class Explorer(torch.nn.Module):
+    def __init__(self, latent_dim):
+        super().__init__()
+        self.latent_dim = latent_dim
+        # Initialize with small random values to avoid starting with extreme perturbations
+        self.mean = torch.nn.Parameter(torch.zeros(latent_dim))
+        # Initialize with a diagonal covariance matrix (independent dimensions)
+        # We use a lower triangular parameterization for positive-definiteness
+        self.tril_indices = torch.tril_indices(latent_dim, latent_dim)
+        # Start with small values on diagonal for numerical stability
+        self.cholesky_factors = torch.nn.Parameter(torch.zeros(self.tril_indices[0].size(0)))
+        # Set diagonal elements to small positive values
+        diag_indices = (self.tril_indices[0] == self.tril_indices[1])
+        with torch.no_grad():
+            self.cholesky_factors[diag_indices] = 0.01
+        
+    def get_distribution(self, batch_size=1, device=None):
+        """
+        Construct MultivariateNormal distribution from parameters.
+        Uses Cholesky decomposition for numerical stability.
+        """
+        # Create lower triangular matrix from parameters
+        # Ensure L has the same dtype as cholesky_factors to avoid dtype mismatch
+        L = torch.zeros(self.latent_dim, self.latent_dim, device=device, dtype=self.cholesky_factors.dtype)
+        L[self.tril_indices[0], self.tril_indices[1]] = self.cholesky_factors
+        
+        # Ensure diagonal elements are positive
+        diag_indices = torch.arange(self.latent_dim)
+        L[diag_indices, diag_indices] = torch.nn.functional.softplus(L[diag_indices, diag_indices])
+        
+        # Create distribution (expand mean for batch dimension if needed)
+        # Ensure mean has the same dtype as L
+        mean_batch = self.mean.to(device=device, dtype=L.dtype).expand(batch_size, -1)
+        return MultivariateNormal(loc=mean_batch, scale_tril=L)
+        
+    def sample(self, latent_token, scale=1.0, deterministic=False):
+        """
+        Sample exploration noise from the learned distribution.
+        
+        Args:
+            latent_token: The latent token to perturb (batch_size, seq_len, hidden_dim)
+            scale: Scaling factor for exploration (0 = no exploration)
+            deterministic: If True, use mean without sampling (for inference)
+            
+        Returns:
+            Perturbed latent token
+        """
+        if scale <= 0.0:
+            return latent_token
+            
+        batch_size, seq_len, hidden_dim = latent_token.shape
+        device = latent_token.device
+        
+        # Get the distribution
+        dist = self.get_distribution(batch_size=batch_size, device=device)
+        
+        if deterministic:
+            # Just use the mean for deterministic mode
+            noise = dist.loc.unsqueeze(1).expand(-1, seq_len, -1)
+        else:
+            # Sample from distribution and reshape to match latent token
+            noise = dist.rsample().unsqueeze(1).expand(-1, seq_len, -1)
+        
+        # Scale noise appropriately (using same normalization as before)
+        noise_scale_normalized = scale / math.sqrt(hidden_dim)
+        # Ensure noise and latent_token have the same dtype
+        noise = noise.to(dtype=latent_token.dtype)
+        noisy_latent = latent_token + noise * noise_scale_normalized
+        
+        return noisy_latent
+
+
 logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "meta-qwen2/Qwen2-2-7b-hf"
@@ -492,6 +566,15 @@ class Qwen2Model(Qwen2PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+        # Initialize the Explorer for latent reasoning with small non-zero values
+        self.explorer = Explorer(config.hidden_size)
+        with torch.no_grad():
+            # Initialize with small but non-zero values to jumpstart exploration
+            self.explorer.mean.uniform_(-0.001, 0.001)  # Small random values
+            # Ensure diagonal elements are positive for stability
+            diag_indices = (self.explorer.tril_indices[0] == self.explorer.tril_indices[1])
+            self.explorer.cholesky_factors[diag_indices] = 0.05
+
     def get_input_embeddings(self):
         return self.embed_tokens
 
@@ -746,7 +829,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         self.model = Qwen2Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
+        
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -843,6 +926,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
         )
     
+    # @torch.compile(mode="reduce-overhead")
     def generate(
         self,
         inputs: Optional[torch.Tensor] = None,
@@ -851,6 +935,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         generation_config: Optional[GenerationMixin] = None,
         return_latent_states: bool = False,
         noise_scale: float = 0.0,
+        forced_token_ids: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ):
         """
@@ -873,6 +958,8 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             generation_config: Generation configuration.
             return_latent_states (bool): Whether to return latent states along with final generated tokens.
             noise_scale (float): Scale of noise to add to latent tokens (0.0 means no noise).
+            forced_token_ids (List[torch.Tensor], optional): List of token ids to force into the generation.
+                Each tensor in the list should have shape (batch_size,) or (batch_size, 1).
             **kwargs: Additional generation parameters.
 
         Returns:
@@ -904,6 +991,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
                 generation_config=generation_config,
                 return_latent_states=return_latent_states,
                 noise_scale=noise_scale,
+                forced_token_ids=forced_token_ids,
                 **kwargs
             )
         else:
@@ -913,6 +1001,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
                 inputs_embeds=input_embeds,
                 eos_token_id=eos_token_id,
                 generation_config=generation_config,
+                forced_token_ids=forced_token_ids,
                 **kwargs
             )
 
@@ -922,6 +1011,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         eos_token_id: int,
         generation_config: Optional[GenerationMixin] = None,
         past_key_values=None,
+        forced_token_ids: Optional[List[torch.Tensor]] = None,
         **kwargs
     ):
         """Token-space generation mode."""
@@ -956,11 +1046,19 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             return initial_token.unsqueeze(1)
 
         # Decoding Phase: Token-space decoding loop
-        return self._token_decoding_loop(self.get_input_embeddings(), initial_token, past, eos_token_id, max_new_tokens=max_new_tokens, **local_kwargs)
+        return self._token_decoding_loop(
+            self.get_input_embeddings(), 
+            initial_token, 
+            past, 
+            eos_token_id, 
+            max_new_tokens=max_new_tokens,
+            forced_token_ids=forced_token_ids,
+            **local_kwargs
+        )
 
     def _inject_noise_to_latent(self, latent_token, noise_scale=0.0):
         """
-        Inject Gaussian noise to latent tokens to encourage exploration.
+        Inject exploration noise to latent tokens using the learned Explorer distribution.
         
         Args:
             latent_token (torch.Tensor): Latent token embeddings (batch, seq_len, hidden_dim)
@@ -972,15 +1070,12 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         if noise_scale <= 0.0:
             return latent_token
             
-        # Generate noise with the same shape as the latent token
-        # Scale by square root of embedding dimension for proper scaling
-        embedding_dim = latent_token.shape[-1]
-        noise = torch.randn_like(latent_token) * noise_scale / math.sqrt(embedding_dim)
+        # Use deterministic mode in eval mode, stochastic in training
+        deterministic = not self.training
         
-        # Add the noise to the latent token
-        noisy_latent = latent_token + noise
-        
-        return noisy_latent
+        # Use the explorer to sample noise
+        # Note: We access explorer via self.model now
+        return self.model.explorer.sample(latent_token, scale=noise_scale, deterministic=deterministic)
 
     def _generate_latent(
         self,
@@ -990,6 +1085,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         generation_config: Optional[GenerationMixin] = None,
         return_latent_states: bool = False,
         noise_scale: float = 0.0,
+        forced_token_ids: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> Union[torch.Tensor, dict]:
         """
@@ -1008,6 +1104,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             generation_config: Generation configuration.
             return_latent_states (bool): Whether to return latent states along with final answer tokens.
             noise_scale (float): Scale of noise to add to latent tokens (0.0 means no noise).
+            forced_token_ids (List[torch.Tensor], optional): List of token IDs to force decode after latent phase.
             **kwargs: Additional generation parameters.
         
         Returns:
@@ -1022,9 +1119,23 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         inputs_embeds = self.model.embed_tokens(inputs)
         batch_size = inputs_embeds.shape[0]
         
-        # Initialize mask for tracking latent vs non-latent tokens
-        # Start with False for all input tokens
-        latent_mask = torch.zeros((batch_size, inputs_embeds.shape[1]), dtype=torch.bool, device=inputs.device)
+        # Prepare data structures based on whether we need to track latent states
+        if return_latent_states:
+            # Initialize mask for tracking latent vs non-latent tokens
+            latent_mask = torch.zeros((batch_size, inputs_embeds.shape[1]), dtype=torch.bool, device=inputs.device)
+            full_sequence_embeds = [inputs_embeds]
+            
+            # Pre-allocate tensor for latent states to avoid repeated concatenations
+            latent_states = torch.zeros(
+                (batch_size, latent_config.num_latent_tokens, inputs_embeds.shape[2]), 
+                dtype=inputs_embeds.dtype, 
+                device=inputs.device
+            )
+        else:
+            # When not returning latent states, we don't need to track these
+            latent_mask = None
+            full_sequence_embeds = None
+            latent_states = None
         
         # Prefill Phase in latent mode
         outputs = self._prefill(inputs_embeds, past_key_values=None, **kwargs)
@@ -1035,92 +1146,105 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         # Apply noise to the first latent token
         latent_token = self._inject_noise_to_latent(latent_token, noise_scale)
         
-        latent_states = [latent_token]
-        
-        # Track embeddings for the full sequence
-        full_sequence_embeds = [inputs_embeds]
-        full_sequence_embeds.append(latent_token)  # Add first latent token
-        
-        # Update mask for first latent token
-        latent_mask = torch.cat([
-            latent_mask,
-            torch.ones((batch_size, 1), dtype=torch.bool, device=inputs.device)  # First latent token
-        ], dim=1)
+        # Store first latent token if tracking
+        if return_latent_states:
+            latent_states[:, 0, :] = latent_token.squeeze(1)
+            full_sequence_embeds.append(latent_token)
+            
+            # Update mask for first latent token
+            new_mask = torch.ones((batch_size, 1), dtype=torch.bool, device=inputs.device)
+            latent_mask = torch.cat([latent_mask, new_mask], dim=1)
         
         # Latent-space Decoding Phase: Generate remaining latent tokens iteratively
-        for _ in range(latent_config.num_latent_tokens - 1):  # -1 because we already have first token
+        for i in range(1, latent_config.num_latent_tokens):  # Start from 1 since we already have first token
             # Create a proper attention mask for this step that matches the KV cache size
             past_length = self._get_past_length(past)
-            step_attention_mask = torch.ones((batch_size, past_length + 1), 
-                                          dtype=torch.long, 
-                                          device=inputs.device)
+            
+            # Reuse the same tensor for attention mask to save memory
+            step_attention_mask = torch.ones(
+                (batch_size, past_length + 1), 
+                dtype=torch.long, 
+                device=inputs.device
+            )
             
             # Use the updated attention mask for this forward pass
             step_kwargs = kwargs.copy()
             step_kwargs['attention_mask'] = step_attention_mask
             
+            # Only request hidden states if we need to track latent states
+            step_kwargs['output_hidden_states'] = return_latent_states
+            
             outputs = self.forward(
                 inputs_embeds=latent_token,
-                output_hidden_states=True,
                 use_cache=True,
                 past_key_values=past,
                 **step_kwargs,
             )
             past = outputs.past_key_values
-            hidden = outputs.hidden_states[-1]
-            latent_token = hidden[:, -1, :].unsqueeze(1)
+            
+            if return_latent_states:
+                hidden = outputs.hidden_states[-1]
+                latent_token = hidden[:, -1, :].unsqueeze(1)
+            else:
+                # Extract directly from logits when we don't need hidden states
+                latent_token = outputs.logits[:, -1, :].unsqueeze(1)
             
             # Apply noise to each generated latent token
             latent_token = self._inject_noise_to_latent(latent_token, noise_scale)
             
-            latent_states.append(latent_token)
-            full_sequence_embeds.append(latent_token)
-            
-            # Update latent mask for this token
-            latent_mask = torch.cat([
-                latent_mask,
-                torch.ones((batch_size, 1), dtype=torch.bool, device=inputs.device)
-            ], dim=1)
+            # Store latent token if tracking
+            if return_latent_states:
+                latent_states[:, i, :] = latent_token.squeeze(1)
+                full_sequence_embeds.append(latent_token)
+                
+                # Update latent mask for this token
+                latent_mask = torch.cat([
+                    latent_mask,
+                    torch.ones((batch_size, 1), dtype=torch.bool, device=inputs.device)
+                ], dim=1)
         
-        # IMPORTANT: Completely reset attention handling for the transition
-        # This handles the case when we have varying sequence lengths in a batch
-        
-        # Before we transition to token generation, completely discard the old attention mask
-        # and create a fresh one that exactly matches the KV cache size
+        # Create fresh attention mask for token generation phase
         past_length = self._get_past_length(past)
-        
-        # The past key values now include all the latent tokens
-        # Create a new attention mask that matches exactly what the model expects
-        # We create a causal mask that allows each token to attend to all previous tokens
         total_length = past_length + 1  # +1 for the EOT token
-        new_attention_mask = torch.ones((batch_size, total_length), 
-                                      dtype=torch.long, 
-                                      device=inputs.device)
+        
+        # Reuse memory for attention mask
+        new_attention_mask = torch.ones(
+            (batch_size, total_length), 
+            dtype=torch.long, 
+            device=inputs.device
+        )
         
         # Update the kwargs with our new attention mask
         token_kwargs = kwargs.copy()
         token_kwargs['attention_mask'] = new_attention_mask
         
-        # Token-space Decoding Phase with fixed attention mask
+        # EOT token embedding
         eot_token_tensor = torch.full((batch_size, 1), self.eot_token_id, dtype=torch.long, device=inputs.device)
         eot_embeds = self.model.embed_tokens(eot_token_tensor)
-        full_sequence_embeds.append(eot_embeds)
         
-        # Update mask for EOT token (non-latent)
-        latent_mask = torch.cat([
-            latent_mask,
-            torch.zeros((batch_size, 1), dtype=torch.bool, device=inputs.device)
-        ], dim=1)
+        if return_latent_states:
+            full_sequence_embeds.append(eot_embeds)
+            
+            # Update mask for EOT token (non-latent)
+            latent_mask = torch.cat([
+                latent_mask,
+                torch.zeros((batch_size, 1), dtype=torch.bool, device=inputs.device)
+            ], dim=1)
         
-        # Generate answer tokens with the new attention mask
+        # Generate answer tokens with the new attention mask and forced token IDs
         answer_tokens = self._generate_with_embeds(
             eot_embeds, 
             eos_token_id,
             generation_config, 
             past_key_values=past,
+            forced_token_ids=forced_token_ids,
             **token_kwargs,
         )
 
+        if not return_latent_states:
+            return answer_tokens
+        
+        # Only process the rest if we're returning latent states
         # Convert answer tokens to embeddings and add to sequence (except last token)
         answer_embeds = self.model.embed_tokens(answer_tokens[:, :-1])
         full_sequence_embeds.append(answer_embeds)
@@ -1131,19 +1255,22 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             torch.zeros((batch_size, answer_embeds.shape[1]), dtype=torch.bool, device=inputs.device)
         ], dim=1)
         
-        # Concatenate all embeddings
+        # Concatenate all embeddings - only done once at the end
         full_sequence_embeds = torch.cat(full_sequence_embeds, dim=1)
-        latent_states = torch.cat(latent_states, dim=1)
+        
+        # --- NEW: Ensure answer_tokens is at least 2-dimensional ---
+        if answer_tokens.dim() == 0:
+            answer_tokens = answer_tokens.unsqueeze(0).unsqueeze(0)
+        elif answer_tokens.dim() == 1:
+            answer_tokens = answer_tokens.unsqueeze(1)
+        # ---------------------------------------------------------------
 
-        if not return_latent_states:
-            return answer_tokens
-        else:
-            return {
-                'input_embeds': full_sequence_embeds,  # Full sequence embeddings except last token
-                'latent_mask': latent_mask,  # Boolean mask indicating latent tokens
-                'answer_token_ids': answer_tokens,
-                'latent_states': latent_states
-            }
+        return {
+            'input_embeds': full_sequence_embeds,  # Full sequence embeddings except last token
+            'latent_mask': latent_mask,  # Boolean mask indicating latent tokens
+            'answer_token_ids': answer_tokens,
+            'latent_states': latent_states
+        }
 
     def generate_with_probe(
         self,
@@ -1198,15 +1325,14 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             noise_scale=noise_scale,
             **kwargs
         )
+        
         # Probe the latent states by projecting to token space
         latent_states = outputs['latent_states']
-
-        batch_size, num_latents, hidden_dim = latent_states.shape
         
-        # Project latents to token space using lm_head
+        # Avoid creating intermediate tensors by directly applying lm_head
         probed_logits = self.lm_head(latent_states)  # (batch, num_latents, vocab_size)
         
-        # Get most likely tokens for each latent state
+        # Use argmax directly rather than creating a softmax distribution
         probed_tokens = torch.argmax(probed_logits, dim=-1)  # (batch, num_latents)
         
         # Return both normal output and probed information
@@ -1246,18 +1372,35 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         Returns:
             The output of the forward pass containing logits, hidden states, and updated cache.
         """
-        # Ensure we get hidden states when in latent mode
-        kwargs['output_hidden_states'] = True
-            
+        # Create a copy of kwargs to avoid modifying the original
+        local_kwargs = kwargs.copy()
+        
+        # Only request what we need - be explicit about what output we want
+        request_hidden = local_kwargs.get('output_hidden_states', True)
+        local_kwargs['output_hidden_states'] = request_hidden
+        
+        # Avoid requesting attentions unless specifically needed
+        if 'output_attentions' not in local_kwargs:
+            local_kwargs['output_attentions'] = False
+        
         return self.forward(
             inputs_embeds=inputs_embeds,
             use_cache=True,
             past_key_values=past_key_values,
-            **kwargs,
+            **local_kwargs,
         )
 
     # New helper: Token-space Decoding Loop (iteratively generate tokens)
-    def _token_decoding_loop(self, token_embedding_layer, initial_token, past, eos_token_id, max_new_tokens, **kwargs):
+    def _token_decoding_loop(
+        self, 
+        token_embedding_layer, 
+        initial_token, 
+        past, 
+        eos_token_id, 
+        max_new_tokens, 
+        forced_token_ids=None, 
+        **kwargs
+    ):
         """
         Token-space Decoding Phase: Iteratively generate tokens using only the most recent token.
         
@@ -1267,28 +1410,88 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             past: Cached past key values.
             eos_token_id (int): End-of-sequence token id.
             max_new_tokens (int): Maximum number of tokens to generate.
+            forced_token_ids (List[torch.Tensor], optional): List of token ids to force into the generation.
+                Each tensor in the list should have shape (batch_size,) or (batch_size, 1).
             **kwargs: Additional arguments for forward.
         
         Returns:
             Tensor of generated token ids.
         """
-        generated_tokens = [initial_token.unsqueeze(1)]
+        # Pre-allocate memory for generated tokens to avoid repeated concatenations
+        batch_size = initial_token.shape[0]
+        generated = torch.zeros((batch_size, max_new_tokens), dtype=torch.long, device=initial_token.device)
+        generated[:, 0] = initial_token
+        
         next_token = initial_token
-        for _ in range(max_new_tokens - 1):
-            next_token_embed = token_embedding_layer(next_token).unsqueeze(1)  # (batch, 1, hidden_dim)
-            outputs = self.forward(
-                inputs_embeds=next_token_embed,
-                use_cache=True,
-                past_key_values=past,
-                **kwargs,
-            )
-            past = outputs.past_key_values
-            logits = outputs.logits
-            next_token = torch.argmax(logits[:, -1, :], dim=-1)
-            generated_tokens.append(next_token.unsqueeze(1))
+        num_generated = 1  # Initial token is already counted
+        
+        # Process forced_token_ids to ensure consistent shape
+        force_idx = 0
+        if forced_token_ids is not None and len(forced_token_ids) > 0:
+            # Ensure each forced token tensor has shape (batch_size,)
+            processed_forced_tokens = []
+            for token_tensor in forced_token_ids:
+                if token_tensor.dim() == 2 and token_tensor.size(1) == 1:
+                    token_tensor = token_tensor.squeeze(1)
+                elif token_tensor.dim() == 0:
+                    # Scalar tensor - expand to batch
+                    token_tensor = token_tensor.expand(batch_size)
+                processed_forced_tokens.append(token_tensor)
+            forced_token_ids = processed_forced_tokens
+        
+        for i in range(max_new_tokens - 1):
+            # Check if we have forced tokens to use
+            use_forced_token = (forced_token_ids is not None and 
+                               force_idx < len(forced_token_ids))
+            
+            # Either use the forced token or generate normally
+            if use_forced_token:
+                # Use the forced token but still run forward pass to update KV cache
+                next_token_embed = token_embedding_layer(next_token).unsqueeze(1)
+                
+                # Run the forward pass to update the KV cache
+                outputs = self.forward(
+                    inputs_embeds=next_token_embed,
+                    use_cache=True,
+                    past_key_values=past,
+                    output_hidden_states=False,
+                    output_attentions=False,
+                    **kwargs,
+                )
+                past = outputs.past_key_values
+                
+                # Use the forced token instead of model prediction
+                next_token = forced_token_ids[force_idx]
+                force_idx += 1
+            else:
+                # Normal generation
+                next_token_embed = token_embedding_layer(next_token).unsqueeze(1)
+                
+                # Only request what we need (no hidden states, no attention outputs)
+                local_kwargs = kwargs.copy()
+                local_kwargs['output_hidden_states'] = False
+                local_kwargs['output_attentions'] = False
+                
+                outputs = self.forward(
+                    inputs_embeds=next_token_embed,
+                    use_cache=True,
+                    past_key_values=past,
+                    **local_kwargs,
+                )
+                past = outputs.past_key_values
+                
+                # Get the next token using argmax - more efficient than creating softmax distribution
+                next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1)
+            
+            # Store the token in our pre-allocated tensor
+            generated[:, num_generated] = next_token
+            num_generated += 1
+            
             if torch.all(next_token == eos_token_id):
                 break
-        return torch.cat(generated_tokens, dim=1)
+        
+        # Only return the tokens that were actually generated
+        return generated[:, :num_generated]
 
     def _get_past_length(self, past_key_values):
         """Helper to get the sequence length from past key values regardless of format.

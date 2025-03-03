@@ -59,7 +59,6 @@ def test_latent_grpo_components():
         ref_model=None,
         tokenizer=tokenizer,
         group_size=4,
-        micro_group_size=2,
         batch_size=2,
         max_iterations=10,
         dataset=dataset,
@@ -244,7 +243,6 @@ def test_batch_latent_grpo():
             ref_model=None,
             tokenizer=tokenizer,
             group_size=4,
-            micro_group_size=2,
             batch_size=2,  # Test with batch_size > 1 and exactly match dataset size
             max_iterations=2,
             dataset=dataset,
